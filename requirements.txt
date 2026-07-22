@@ -1,5 +1,6 @@
 numpy==1.24.4
 fastapi
+httpx
 uvicorn
 pandas
 scikit-learn

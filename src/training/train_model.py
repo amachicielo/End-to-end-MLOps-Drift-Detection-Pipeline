@@ -1,54 +1,93 @@
-import pandas as pd
+import os
+import urllib.request
+import zipfile
+
+import joblib
 import mlflow
 import mlflow.sklearn
-import os
-import zipfile
-import urllib.request
-import joblib
+import pandas as pd
+from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+DATASET_PATH = "data/bank.csv"
+MODEL_PATH = "models/model.joblib"
 
 
+def ensure_dataset(dataset_path=DATASET_PATH):
+    if os.path.exists(dataset_path):
+        return dataset_path
+    os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+    archive_path = "data/bank.zip"
+    urllib.request.urlretrieve(
+        "https://archive.ics.uci.edu/static/public/222/bank+marketing.zip",
+        archive_path,
+    )
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archive.extractall("data")
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Expected dataset at {dataset_path} after extraction.")
+    return dataset_path
 
-def ensure_dataset():
-    if not os.path.exists("data/bank.csv"):
-        print("📥 Downloading dataset...")
-        url = "https://archive.ics.uci.edu/static/public/222/bank+marketing.zip"
-        zip_path = "data/bank.zip"
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall("data/")
-        print("✅ Dataset downloaded and extracted.")
-    else:
-        print("✅ Dataset already exists. Cannot be downloaded.")
+
+def build_pipeline(frame):
+    categorical = frame.select_dtypes(include=["object", "category"]).columns.tolist()
+    numeric = [column for column in frame.columns if column not in categorical]
+    preprocessor = ColumnTransformer(
+        [
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical),
+            ("numeric", "passthrough", numeric),
+        ]
+    )
+    model = RandomForestClassifier(
+        n_estimators=200,
+        min_samples_leaf=2,
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1,
+    )
+    return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
 
-def train_and_save_model():
-    ensure_dataset()
-    df = pd.read_csv("data/bank.csv", sep=";")
-    df = df.dropna()
+def train_and_save_model(dataset_path=DATASET_PATH, model_path=MODEL_PATH):
+    dataset_path = ensure_dataset(dataset_path)
+    frame = pd.read_csv(dataset_path, sep=";").dropna()
+    features = frame.drop(columns="y")
+    target = (frame["y"] == "yes").astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(
+        features,
+        target,
+        test_size=0.25,
+        random_state=42,
+        stratify=target,
+    )
 
-    X = df.drop("y", axis=1)
-    y = df["y"].apply(lambda x: 1 if x == "yes" else 0)
-    X = pd.get_dummies(X)
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=42)
-
-    model = RandomForestClassifier()
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
+    pipeline = build_pipeline(features)
+    pipeline.fit(X_train, y_train)
+    predictions = pipeline.predict(X_test)
+    probabilities = pipeline.predict_proba(X_test)[:, 1]
+    metrics = {
+        "accuracy": accuracy_score(y_test, predictions),
+        "f1": f1_score(y_test, predictions),
+        "roc_auc": roc_auc_score(y_test, probabilities),
+    }
 
     mlflow.set_experiment("Bank_Marketing_Drift_Demo")
-
     with mlflow.start_run():
-        mlflow.log_params(model.get_params())
-        mlflow.log_metric("accuracy", accuracy)
-        mlflow.sklearn.log_model(model, "model")
+        mlflow.log_params({"model": "RandomForestClassifier", "random_state": 42})
+        mlflow.log_metrics(metrics)
+        mlflow.sklearn.log_model(pipeline, "model")
 
-    os.makedirs("mlruns/models", exist_ok=True)
-    joblib.dump(model, "mlruns/models/random_forest.pkl")
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    joblib.dump(
+        {"pipeline": pipeline, "feature_columns": list(features.columns)},
+        model_path,
+    )
+    return metrics
 
-    return accuracy
+
+if __name__ == "__main__":
+    print(train_and_save_model())
